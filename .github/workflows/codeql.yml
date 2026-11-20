@@ -1,0 +1,81 @@
+name: sast
+
+# Stage: static application security testing (CodeQL, security-extended suite).
+# build-mode none analyses the source directly, so it needs no GitHub Packages
+# token and cannot be broken by dependency resolution.
+#
+# Results always go to Code scanning. The gate fails the pipeline when any result
+# is rated high or critical (CVSS-based security-severity >= 7.0); medium and low
+# stay visible in the Security tab for triage without blocking delivery.
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: CodeQL language (java-kotlin, javascript-typescript)
+        type: string
+        required: true
+      severity-threshold:
+        description: Lowest security-severity score that fails the pipeline
+        type: string
+        default: '7.0'
+
+permissions: {}
+
+jobs:
+  codeql:
+    name: codeql (${{ inputs.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ inputs.language }}
+          build-mode: none
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ inputs.language }}
+          output: ${{ runner.temp }}/codeql-sarif
+
+      # Rule metadata lives on the driver and, for query packs, on the tool
+      # extensions; both are joined to map each result's ruleId to its score.
+      - name: Gate on high and critical findings
+        env:
+          SARIF_DIR: ${{ runner.temp }}/codeql-sarif
+          THRESHOLD: ${{ inputs.severity-threshold }}
+        run: |
+          total=0
+          for f in "$SARIF_DIR"/*.sarif; do
+            [ -e "$f" ] || continue
+            n=$(jq --argjson t "$THRESHOLD" '
+              [ .runs[]
+                | ( [ (.tool.driver.rules // [])[], ((.tool.extensions // [])[] | (.rules // [])[]) ]
+                    | map({ key: .id, value: ((.properties["security-severity"] // "0") | tonumber) })
+                    | from_entries ) as $sev
+                | (.results // [])[]
+                | select(($sev[.ruleId] // 0) >= $t)
+                | "\(.ruleId) \(.locations[0].physicalLocation.artifactLocation.uri // "?"):\(.locations[0].physicalLocation.region.startLine // 0)"
+              ]' "$f")
+            count=$(echo "$n" | jq 'length')
+            echo "$n" | jq -r '.[] | "::error::CodeQL " + .'
+            total=$((total + count))
+          done
+          {
+            echo "### SAST (CodeQL ${{ inputs.language }})"
+            echo "Findings at security-severity >= ${THRESHOLD}: **${total}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$total" -eq 0 ]

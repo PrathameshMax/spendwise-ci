@@ -1,0 +1,409 @@
+name: release
+
+# Stages: Change Request gate -> Release preparation (version, release notes) ->
+# Deploy to PROD (approval) -> Close the Change Request.
+#
+# Production is reached only through here, and only when:
+#   1. the Change Request issue in spendwise-platform is open, labelled
+#      change-request + approved (and not rejected), names this service, names
+#      the commit being released, and the current time is inside its window;
+#   2. the image built from that commit is the one uat currently holds, i.e. it
+#      is the artifact that was actually tested in UAT;
+#   3. the image's signature verifies against this repository's pipeline and
+#      that exact commit;
+#   4. a required reviewer approves the prod environment.
+# The gate runs twice: when the release is prepared and again at deploy time,
+# because approval of the prod environment can happen hours later.
+#
+# The Change Request is updated with the outcome (comment + implemented/failed
+# label) so the change record holds the full audit trail.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+      change-request:
+        description: Change Request issue number in the CR repository
+        type: string
+        required: true
+      bump:
+        description: Semantic version part to increase (patch, minor, major)
+        type: string
+        default: patch
+      cr-repository:
+        type: string
+        default: PrathameshMax/spendwise-platform
+    secrets:
+      CHANGE_MGMT_TOKEN:
+        description: Fine-grained token with Issues read/write on the CR repository
+        required: true
+    outputs:
+      version:
+        value: ${{ jobs.prepare.outputs.version }}
+
+permissions: {}
+
+env:
+  SIGNER_IDENTITY: ^https://github\.com/PrathameshMax/spendwise-ci/\.github/workflows/container-image\.yml@refs/(heads/main|tags/v[0-9.]+)$
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  # ---- Change Request gate + Release preparation ----------------------------
+  prepare:
+    name: change gate, release preparation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.gate.outputs.commit }}
+      digest: ${{ steps.artifact.outputs.digest }}
+      image: ${{ steps.artifact.outputs.image }}
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - &change-gate
+        name: Change Request gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.CHANGE_MGMT_TOKEN }}
+          CR_REPO: ${{ inputs.cr-repository }}
+          CR_NUMBER: ${{ inputs.change-request }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases run from main only (this run: ${REF})."
+            exit 1
+          fi
+          if ! [[ "$CR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::change-request must be an issue number, got '${CR_NUMBER}'."
+            exit 1
+          fi
+          gh api "repos/${CR_REPO}/issues/${CR_NUMBER}" > "$RUNNER_TEMP/cr.json"
+          gh api --paginate "repos/${CR_REPO}/issues/${CR_NUMBER}/events" \
+            --jq '[.[] | select(.event == "labeled" and .label.name == "approved")] | last | .actor.login // ""' \
+            > "$RUNNER_TEMP/approver.txt"
+          python3 - "$RUNNER_TEMP/cr.json" "$RUNNER_TEMP/approver.txt" <<'PY'
+          import datetime, json, os, re, sys
+
+          cr = json.load(open(sys.argv[1]))
+          logins = [l.strip() for l in open(sys.argv[2]).read().splitlines() if l.strip()]
+          approver = logins[-1] if logins else ""
+          errors = []
+
+          if "pull_request" in cr:
+              errors.append("the number is a pull request, not a Change Request issue")
+          labels = {label["name"] for label in cr.get("labels", [])}
+          if cr.get("state") != "open":
+              errors.append(f"the Change Request is {cr.get('state')}, it must be open")
+          for required in ("change-request", "approved"):
+              if required not in labels:
+                  errors.append(f"label '{required}' is missing")
+          for blocking in ("rejected", "implemented", "failed"):
+              if blocking in labels:
+                  errors.append(f"label '{blocking}' is present")
+
+          # Issue forms render as "### <label>\n\n<value>".
+          fields = {}
+          for block in re.split(r"^### ", cr.get("body") or "", flags=re.M)[1:]:
+              heading, _, value = block.partition("\n")
+              value = value.strip()
+              fields[heading.strip()] = "" if value == "_No response_" else value
+
+          def field(name):
+              value = fields.get(name, "")
+              if not value:
+                  errors.append(f"field '{name}' is empty")
+              return value
+
+          service = field("Service")
+          commit = field("Commit SHA").lower()
+          change_type = field("Change type")
+          risk = field("Risk")
+          field("Implementation plan")
+          field("Rollback plan")
+          field("Test evidence")
+          start_raw = field("Window start (UTC)")
+          end_raw = field("Window end (UTC)")
+
+          repo_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
+          if service and service != repo_name:
+              errors.append(f"the Change Request is for '{service}', this is '{repo_name}'")
+          if commit and not re.fullmatch(r"[0-9a-f]{40}", commit):
+              errors.append(f"'Commit SHA' must be a full 40-character commit SHA, got '{commit}'")
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          window = ""
+          try:
+              start = datetime.datetime.strptime(start_raw, "%Y-%m-%d %H:%M").replace(tzinfo=datetime.timezone.utc)
+              end = datetime.datetime.strptime(end_raw, "%Y-%m-%d %H:%M").replace(tzinfo=datetime.timezone.utc)
+              window = f"{start_raw} to {end_raw} UTC"
+              if end <= start:
+                  errors.append("the change window ends before it starts")
+              elif not (start <= now <= end):
+                  errors.append(f"now ({now:%Y-%m-%d %H:%M} UTC) is outside the change window {window}")
+          except ValueError:
+              if start_raw and end_raw:
+                  errors.append("window times must be 'YYYY-MM-DD HH:MM' in UTC")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::CR #{cr.get('number')}: {e}")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"commit={commit}\n")
+              out.write(f"title={cr['title']}\n")
+              out.write(f"url={cr['html_url']}\n")
+              out.write(f"change-type={change_type}\n")
+              out.write(f"risk={risk}\n")
+              out.write(f"window={window}\n")
+              out.write(f"approver={approver}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### Change Request [#{cr['number']}]({cr['html_url']}): {cr['title']}\n\n")
+              s.write("| Check | Result |\n|---|---|\n")
+              s.write("| Labels | change-request, approved |\n")
+              s.write(f"| Approved by | @{approver or 'unknown'} |\n")
+              s.write(f"| Service | {service} |\n")
+              s.write(f"| Commit | `{commit}` |\n")
+              s.write(f"| Change type / risk | {change_type} / {risk} |\n")
+              s.write(f"| Window | {window} (now {now:%Y-%m-%d %H:%M} UTC) |\n")
+          PY
+
+      - name: Commit is on main
+        env:
+          COMMIT: ${{ steps.gate.outputs.commit }}
+        run: |
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "::error::${COMMIT} is not on main."
+            exit 1
+          fi
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # The commit's image must be exactly what uat runs: a release cannot skip UAT.
+      - name: Artifact under release is the one in UAT
+        id: artifact
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          COMMIT: ${{ steps.gate.outputs.commit }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          built=$(docker buildx imagetools inspect "${image}:${COMMIT}" --format '{{json .Manifest}}' | jq -r .digest)
+          in_uat=$(docker buildx imagetools inspect "${image}:uat" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "built from ${COMMIT}: ${built}"
+          echo "currently in uat:  ${in_uat}"
+          if [ -z "$built" ] || [ "$built" = "null" ]; then
+            echo "::error::No image ${image}:${COMMIT}. Was this commit built on main?"
+            exit 1
+          fi
+          if [ "$built" != "$in_uat" ]; then
+            echo "::error::uat holds ${in_uat}, not the image built from ${COMMIT}. Promote this build to uat and complete UAT first."
+            exit 1
+          fi
+          cosign verify "${image}@${built}" \
+            --certificate-identity-regexp "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$COMMIT" > /dev/null
+          {
+            echo "image=${image}"
+            echo "digest=${built}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- Release preparation ---------------------------------------------
+      - name: Next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          last=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)
+          if [ -z "$last" ]; then
+            next=v1.0.0
+          else
+            IFS=. read -r major minor patch <<< "${last#v}"
+            case "$BUMP" in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v${major}.$((minor + 1)).0" ;;
+              patch) next="v${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::bump must be patch, minor or major"; exit 1 ;;
+            esac
+          fi
+          {
+            echo "version=${next}"
+            echo "previous=${last}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Previous release: ${last:-none}. This release: ${next}."
+
+      - name: Release notes and draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+          COMMIT: ${{ steps.gate.outputs.commit }}
+          IMAGE: ${{ steps.artifact.outputs.image }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          CR_NUMBER: ${{ inputs.change-request }}
+          CR_URL: ${{ steps.gate.outputs.url }}
+          CR_TITLE: ${{ steps.gate.outputs.title }}
+          APPROVER: ${{ steps.gate.outputs.approver }}
+          CHANGE_TYPE: ${{ steps.gate.outputs.change-type }}
+          RISK: ${{ steps.gate.outputs.risk }}
+          WINDOW: ${{ steps.gate.outputs.window }}
+        run: |
+          args=(-f "tag_name=${VERSION}" -f "target_commitish=${COMMIT}")
+          if [ -n "$PREVIOUS" ]; then args+=(-f "previous_tag_name=${PREVIOUS}"); fi
+          generated=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" "${args[@]}" --jq .body)
+          chart="none"
+          if git cat-file -e "${COMMIT}:chart/Chart.yaml" 2>/dev/null; then
+            name=$(git show "${COMMIT}:chart/Chart.yaml" | awk -F': *' '$1 == "name" { print $2; exit }')
+            base=$(git show "${COMMIT}:chart/Chart.yaml" | awk -F': *' '$1 == "version" { print $2; exit }')
+            chart="\`oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts/${name}\` version \`${base}-g${COMMIT::7}\`"
+          fi
+          {
+            echo "## Release ${VERSION}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Change Request | [#${CR_NUMBER}](${CR_URL}) ${CR_TITLE} |"
+            echo "| Approved by | @${APPROVER} |"
+            echo "| Change type / risk | ${CHANGE_TYPE} / ${RISK} |"
+            echo "| Change window | ${WINDOW} |"
+            echo "| Commit | \`${COMMIT}\` |"
+            echo "| Image | \`${IMAGE}@${DIGEST}\` |"
+            echo "| Helm chart | ${chart} |"
+            echo "| Pipeline run | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |"
+            echo
+            echo "$generated"
+          } > "$RUNNER_TEMP/notes.md"
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            echo "::error::Release ${VERSION} already exists."
+            exit 1
+          fi
+          gh release create "$VERSION" --draft --target "$COMMIT" --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- Deploy to PROD ------------------------------------------------------
+  prod:
+    name: deploy to prod
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: prod
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      # Same gate again: the CR may have been rejected, or the window closed,
+      # while the prod approval was pending.
+      - *change-gate
+
+      - name: Change Request still names the prepared commit
+        env:
+          PREPARED: ${{ needs.prepare.outputs.commit }}
+          NOW: ${{ steps.gate.outputs.commit }}
+        run: |
+          if [ "$PREPARED" != "$NOW" ]; then
+            echo "::error::The Change Request was edited after preparation (commit ${PREPARED} -> ${NOW}). Start a new release."
+            exit 1
+          fi
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Verify and move artifact to prod
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity-regexp "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$COMMIT" > /dev/null
+          docker buildx imagetools create \
+            --tag "${IMAGE}:prod" \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          {
+            echo "### Deployed to prod"
+            echo "${VERSION}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${VERSION}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- Close the Change Request --------------------------------------------
+  close-change:
+    name: update change request
+    needs: [prepare, prod]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Record the outcome on the Change Request
+        env:
+          GH_TOKEN: ${{ secrets.CHANGE_MGMT_TOKEN }}
+          CR_REPO: ${{ inputs.cr-repository }}
+          CR_NUMBER: ${{ inputs.change-request }}
+          RESULT: ${{ needs.prod.result }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          tick='`'
+          if [ "$RESULT" = "success" ]; then
+            body="Implemented: ${GITHUB_REPOSITORY} ${VERSION} deployed to prod.
+
+          - Image: ${tick}${IMAGE}@${DIGEST}${tick}
+          - Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${VERSION}
+          - Run: ${run_url}"
+            gh issue comment "$CR_NUMBER" --repo "$CR_REPO" --body "$body"
+            gh issue edit "$CR_NUMBER" --repo "$CR_REPO" --add-label implemented
+            gh issue close "$CR_NUMBER" --repo "$CR_REPO" --reason completed
+          else
+            body="Not implemented: the prod stage of ${GITHUB_REPOSITORY} ${VERSION} ended with result '${RESULT}'. Production is unchanged.
+
+          - Run: ${run_url}"
+            gh issue comment "$CR_NUMBER" --repo "$CR_REPO" --body "$body"
+            gh issue edit "$CR_NUMBER" --repo "$CR_REPO" --add-label failed
+          fi

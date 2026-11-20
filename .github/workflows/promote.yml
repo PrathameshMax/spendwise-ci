@@ -1,0 +1,112 @@
+name: promote
+
+# Stage: environment promotion. Build once, promote the same digest:
+#
+#   main build ──> dev ──> sit ──(approval)──> uat
+#
+# prod is not reached from here: it is released by release.yml, which needs an
+# approved Change Request and promotes whatever digest uat holds.
+#
+# Nothing is rebuilt. Each environment is a moving tag (dev, sit, uat) that is
+# re-pointed at the exact digest the pipeline built, signed and scanned. Before
+# re-pointing, the signature is verified against this repository's workflows:
+# an image pushed by hand, or by any other workflow, cannot be promoted.
+#
+# Approvals come from GitHub Environments (scripts/setup-repo-governance.sh):
+# dev and sit promote automatically, uat waits for a required reviewer.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Fully qualified image name without tag (ghcr.io/<owner>/<name>)
+        type: string
+        required: true
+      digest:
+        description: sha256 digest produced by the container stage
+        type: string
+        required: true
+
+permissions: {}
+
+env:
+  SIGNER_IDENTITY: ^https://github\.com/PrathameshMax/spendwise-ci/\.github/workflows/container-image\.yml@refs/(heads/main|tags/v[0-9.]+)$
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  dev:
+    name: promote to dev
+    if: inputs.digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: dev
+    permissions:
+      contents: read
+      packages: write
+    steps: &promote-steps
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Verify signature
+        env:
+          REF: ${{ inputs.image }}@${{ inputs.digest }}
+        run: |
+          cosign verify "$REF" \
+            --certificate-identity-regexp "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            > /dev/null
+          echo "Signature verified for $REF"
+
+      - name: Re-point environment tag
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          ENV_NAME: ${{ github.job }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${ENV_NAME}" \
+            "${IMAGE}@${DIGEST}"
+          {
+            echo "### ${ENV_NAME}"
+            echo "\`${IMAGE}:${ENV_NAME}\` → \`${DIGEST}\`"
+            echo
+            echo "Commit \`${GITHUB_SHA}\`, run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sit:
+    name: promote to sit
+    needs: dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: sit
+    permissions:
+      contents: read
+      packages: write
+    steps: *promote-steps
+
+  uat:
+    name: promote to uat
+    needs: sit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: uat
+    permissions:
+      contents: read
+      packages: write
+    steps: *promote-steps

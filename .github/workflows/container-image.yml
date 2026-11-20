@@ -1,0 +1,463 @@
+name: container
+
+# Stages: Dockerfile lint -> build -> image vulnerability and secret scan ->
+# runtime policy check -> SBOM -> (main only) push -> sign -> attest,
+# then the Helm chart: lint -> render -> schema and misconfiguration checks ->
+# (main only) package with the image digest -> push to GHCR (OCI) -> sign.
+#
+# The image is built and scanned locally BEFORE anything is pushed, so a
+# vulnerable image never reaches the registry. Only main publishes; pull
+# requests run every check and stop before the push.
+#
+# Published images carry three verifiable statements, all bound to the digest:
+#   - a cosign keyless signature (Sigstore, identity = this workflow file),
+#   - SLSA build provenance (which repo, commit and workflow built it),
+#   - a CycloneDX SBOM attestation (what is inside it).
+# promote.yml refuses to promote an image whose signature does not verify.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name under ghcr.io/<owner>/ (e.g. spendwise-user-service)
+        type: string
+        required: true
+      severity:
+        description: Vulnerability severities that fail the build
+        type: string
+        default: CRITICAL,HIGH
+    secrets:
+      PACKAGES_READ_TOKEN:
+        description: read:packages token, passed to the Docker build as the gh_token BuildKit secret
+        required: false
+    outputs:
+      image:
+        description: Fully qualified image name (no tag)
+        value: ${{ jobs.image.outputs.image }}
+      digest:
+        description: sha256 digest of the pushed image (empty when nothing was pushed)
+        value: ${{ jobs.image.outputs.digest }}
+      chart:
+        description: OCI reference of the pushed Helm chart, name:version (empty when none)
+        value: ${{ jobs.chart.outputs.chart }}
+      chart-digest:
+        description: sha256 digest of the pushed Helm chart (empty when none)
+        value: ${{ jobs.chart.outputs.digest }}
+
+permissions: {}
+
+env:
+  TRIVY_VERSION: v0.70.0
+  HELM_VERSION: v3.22.1
+  KUBECONFORM_VERSION: v0.8.0
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+  KUBERNETES_VERSION: 1.31.0
+
+jobs:
+  image:
+    name: build, scan, sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve names
+        id: names
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          publish=false
+          if [ "$EVENT" != "pull_request" ] && [ "$REF" = "refs/heads/main" ]; then
+            publish=true
+          fi
+          ignores=""
+          if [ -f .trivyignore.yaml ]; then
+            ignores=.trivyignore.yaml
+          fi
+          {
+            echo "image=ghcr.io/${owner}/${IMAGE_NAME}"
+            echo "local=local/${IMAGE_NAME}:${GITHUB_SHA}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "publish=${publish}"
+            echo "trivyignores=${ignores}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- Dockerfile lint -------------------------------------------------
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # ---- Build for scanning (never pushed) ------------------------------
+      - name: Build image for scanning
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ steps.names.outputs.local }}
+          secrets: |
+            gh_token=${{ secrets.PACKAGES_READ_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- Image scan ------------------------------------------------------
+      # First pass: everything, to Code scanning, never fails.
+      - name: Scan image (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: ${{ steps.names.outputs.local }}
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: '0'
+          trivyignores: ${{ steps.names.outputs.trivyignores }}
+
+      - name: Upload image findings to Code scanning
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # Second pass: the gate. Fixable vulnerabilities at the configured
+      # severities, and any secret baked into a layer, fail the build.
+      # A risk-accepted CVE goes in .trivyignore.yaml with an expired_at date.
+      - name: Scan image (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: ${{ steps.names.outputs.local }}
+          scanners: vuln,secret
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+          trivyignores: ${{ steps.names.outputs.trivyignores }}
+
+      # ---- Runtime policy --------------------------------------------------
+      - name: Image policy (non-root, healthcheck, source label)
+        env:
+          LOCAL: ${{ steps.names.outputs.local }}
+        run: |
+          user=$(docker image inspect "$LOCAL" --format '{{.Config.User}}')
+          health=$(docker image inspect "$LOCAL" --format '{{if .Config.Healthcheck}}{{join .Config.Healthcheck.Test " "}}{{end}}')
+          size=$(docker image inspect "$LOCAL" --format '{{.Size}}')
+          fail=0
+          case "$user" in
+            ""|root|0|0:0|root:root) echo "::error::Image runs as root (USER='${user}'). Add a non-root USER."; fail=1 ;;
+          esac
+          if [ -z "$health" ] || [ "$health" = "NONE" ]; then
+            echo "::error::Image has no HEALTHCHECK."; fail=1
+          fi
+          {
+            echo "### Image policy"
+            echo "| Check | Value |"
+            echo "|---|---|"
+            echo "| USER | \`${user:-<root>}\` |"
+            echo "| HEALTHCHECK | \`${health:-<none>}\` |"
+            echo "| Size | $((size / 1024 / 1024)) MiB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$fail"
+
+      # ---- SBOM ------------------------------------------------------------
+      - name: Generate image SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: ${{ steps.names.outputs.local }}
+          format: cyclonedx
+          output: sbom-image.cdx.json
+          exit-code: '0'
+
+      - name: Keep SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-image
+          path: sbom-image.cdx.json
+          retention-days: 90
+
+      # ---- Publish (main only) --------------------------------------------
+      - name: Log in to GHCR
+        if: steps.names.outputs.publish == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same inputs and the warm cache from the scan build, so this produces the
+      # layers that were just scanned. BuildKit adds its own max-mode provenance
+      # and SBOM to the manifest.
+      - name: Push image
+        id: push
+        if: steps.names.outputs.publish == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ steps.names.outputs.image }}:${{ github.sha }}
+            ${{ steps.names.outputs.image }}:main
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.names.outputs.created }}
+            org.opencontainers.image.title=${{ inputs.image-name }}
+          secrets: |
+            gh_token=${{ secrets.PACKAGES_READ_TOKEN }}
+          cache-from: type=gha
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: steps.names.outputs.publish == 'true'
+
+      # Keyless: the certificate is issued to this workflow's OIDC identity, so
+      # a signature proves the image came out of this pipeline, not a laptop.
+      - name: Sign image
+        if: steps.names.outputs.publish == 'true'
+        env:
+          REF: ${{ steps.names.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
+
+      - name: Attest build provenance
+        if: steps.names.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest SBOM
+        if: steps.names.outputs.publish == 'true'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom-image.cdx.json
+          push-to-registry: true
+
+      - name: Summary
+        if: steps.names.outputs.publish == 'true'
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Published"
+            echo "\`${IMAGE}@${DIGEST}\`"
+            echo
+            echo "Tags: \`${GITHUB_SHA}\`, \`main\` — signed, provenance and SBOM attested."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- Helm chart ("Create Helm Chart") --------------------------------------
+  # Runs when the repository has chart/Chart.yaml. Pull requests lint and
+  # validate it; main packages it with the exact image digest built above, so
+  # the chart can only ever deploy the image that was scanned and signed.
+  chart:
+    name: helm chart
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    outputs:
+      chart: ${{ steps.push.outputs.chart }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find chart
+        id: find
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ ! -f chart/Chart.yaml ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "### Helm chart: none (no chart/Chart.yaml)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          name=$(awk -F': *' '$1 == "name" { print $2; exit }' chart/Chart.yaml)
+          base=$(awk -F': *' '$1 == "version" { print $2; exit }' chart/Chart.yaml)
+          publish=false
+          if [ "$EVENT" != "pull_request" ] && [ "$REF" = "refs/heads/main" ] && [ -n "$IMAGE_DIGEST" ]; then
+            publish=true
+          fi
+          {
+            echo "present=true"
+            echo "name=${name}"
+            echo "version=${base}-g${GITHUB_SHA::7}"
+            echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        if: steps.find.outputs.present == 'true'
+        with:
+          version: ${{ env.HELM_VERSION }}
+          checksum-policy: required
+
+      - name: Install kubeconform (checksum verified)
+        if: steps.find.outputs.present == 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSLf -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum --check --strict
+          tar -xzf kubeconform.tar.gz kubeconform
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      # On main the real digest is written into values.yaml; on a pull request a
+      # well-formed placeholder digest exercises the same template path.
+      - name: Pin image digest in values.yaml
+        if: steps.find.outputs.present == 'true'
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          digest="${IMAGE_DIGEST:-sha256:0000000000000000000000000000000000000000000000000000000000000000}"
+          if [ "$(grep -c '^  digest: ""$' chart/values.yaml)" -ne 1 ]; then
+            echo "::error file=chart/values.yaml::expected exactly one 'image.digest: \"\"' line to pin"
+            exit 1
+          fi
+          sed -i "s|^  digest: \"\"$|  digest: \"${digest}\"|" chart/values.yaml
+          grep -n '^  digest:' chart/values.yaml
+
+      - name: Lint chart
+        if: steps.find.outputs.present == 'true'
+        run: helm lint chart --strict
+
+      - name: Render and validate against the Kubernetes API schema
+        if: steps.find.outputs.present == 'true'
+        env:
+          NAME: ${{ steps.find.outputs.name }}
+        run: |
+          mkdir -p rendered
+          helm template "$NAME" chart --namespace spendwise > rendered/manifests.yaml
+          kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" rendered/manifests.yaml
+
+      - name: Scan rendered manifests (report)
+        if: steps.find.outputs.present == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: rendered
+          format: sarif
+          output: trivy-chart.sarif
+          exit-code: '0'
+
+      - name: Upload chart findings to Code scanning
+        if: always() && steps.find.outputs.present == 'true' && hashFiles('trivy-chart.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-chart.sarif
+          category: trivy-chart
+
+      - name: Scan rendered manifests (gate)
+        if: steps.find.outputs.present == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: config
+          scan-ref: rendered
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: '1'
+
+      - name: Package and push chart
+        id: push
+        if: steps.find.outputs.publish == 'true'
+        env:
+          NAME: ${{ steps.find.outputs.name }}
+          VERSION: ${{ steps.find.outputs.version }}
+          REGISTRY: ${{ steps.find.outputs.registry }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          helm package chart --version "$VERSION" --app-version "$GITHUB_SHA" --destination dist
+          helm push "dist/${NAME}-${VERSION}.tgz" "oci://${REGISTRY}" 2>&1 | tee push.log
+          digest=$(awk '/^Digest:/ { print $2 }' push.log)
+          if [ -z "$digest" ]; then
+            echo "::error::helm push printed no digest"
+            exit 1
+          fi
+          {
+            echo "chart=${REGISTRY}/${NAME}:${VERSION}"
+            echo "digest=${digest}"
+            echo "ref=${REGISTRY}/${NAME}@${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: steps.find.outputs.publish == 'true'
+
+      - name: Sign chart
+        if: steps.find.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ steps.push.outputs.ref }}
+        run: |
+          echo "$GH_TOKEN" | cosign login ghcr.io --username "$ACTOR" --password-stdin
+          cosign sign --yes "$REF"
+
+      - name: Summary
+        if: steps.find.outputs.present == 'true'
+        env:
+          PUBLISH: ${{ steps.find.outputs.publish }}
+          CHART: ${{ steps.push.outputs.chart }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          NAME: ${{ steps.find.outputs.name }}
+        run: |
+          {
+            echo "### Helm chart"
+            if [ "$PUBLISH" = "true" ]; then
+              echo "\`oci://${CHART}\` (\`${DIGEST}\`), signed, image pinned by digest."
+              echo
+              echo "\`helm install ${NAME} oci://${CHART%:*} --version ${CHART##*:}\`"
+            else
+              echo "Linted, rendered and validated (not published on this event)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

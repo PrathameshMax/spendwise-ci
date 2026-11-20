@@ -1,0 +1,60 @@
+name: self-check
+
+# The pipeline templates are code too: every change to them is linted
+# (actionlint, with shellcheck on every run: block) and secret-scanned before
+# it can be tagged and picked up by the service repositories.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (checksum verified)
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSLf -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+
+      - name: Lint workflows
+        run: |
+          "$RUNNER_TEMP/actionlint" -color
+
+      # Every third-party action must be pinned to a full commit SHA.
+      - name: Actions are pinned to commit SHAs
+        run: |
+          bad=$(grep -RhoE 'uses:[[:space:]]+[^ #]+' .github/workflows \
+                | awk '{print $2}' \
+                | grep -vE '^\./' \
+                | grep -vE '^PrathameshMax/spendwise-ci/' \
+                | grep -vE '@[0-9a-f]{40}$' || true)
+          if [ -n "$bad" ]; then
+            while IFS= read -r ref; do
+              echo "::error::Not pinned to a commit SHA: ${ref}"
+            done <<< "$bad"
+            exit 1
+          fi
+
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+    permissions:
+      contents: read
+      security-events: write

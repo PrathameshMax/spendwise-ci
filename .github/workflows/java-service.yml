@@ -1,0 +1,352 @@
+name: java-service
+
+# The SpendWise golden pipeline for a Maven / Spring Boot repository.
+#
+#   secret-scan ─┐
+#   sast ────────┤
+#   build-test ──┼──> container (lint, build, scan, policy, SBOM, push, sign, attest)
+#   integration ─┤        └──> helm chart (lint, render, validate, package, push, sign)
+#   sca ─────────┘
+#
+# build-test also runs the SonarCloud analysis and waits for its quality gate
+# (new-code coverage, duplication, reliability, maintainability, security hotspots).
+#
+# Every gate runs in parallel; the image is built only when all of them pass.
+# A library repository (no Dockerfile) passes image-name: '' and stops after the gates.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name under ghcr.io/<owner>/; empty for a library with no image
+        type: string
+        default: ''
+      maven-settings:
+        description: settings.xml used for GitHub Packages; empty when the build needs none
+        type: string
+        default: ci-settings.xml
+      java-version:
+        type: string
+        default: '21'
+      coverage-min:
+        description: Minimum line coverage (%) of the unit test run
+        type: number
+        default: 60
+      severity:
+        description: Vulnerability severities that fail the dependency and image scans
+        type: string
+        default: CRITICAL,HIGH
+      sonar-organization:
+        description: SonarCloud organization key
+        type: string
+        default: prathameshmax
+      sonar-project-key:
+        description: SonarCloud project key; empty means <owner>_<repository>, the key SonarCloud gives an imported repository
+        type: string
+        default: ''
+    secrets:
+      PACKAGES_READ_TOKEN:
+        description: Classic token with read:packages, for spendwise-shared artifacts
+        required: false
+      SONAR_TOKEN:
+        description: SonarCloud analysis token
+        required: true
+    outputs:
+      image:
+        value: ${{ jobs.container.outputs.image }}
+      digest:
+        value: ${{ jobs.container.outputs.digest }}
+      chart:
+        value: ${{ jobs.container.outputs.chart }}
+      chart-digest:
+        value: ${{ jobs.container.outputs.chart-digest }}
+
+permissions: {}
+
+env:
+  JACOCO: org.jacoco:jacoco-maven-plugin:0.8.14
+  CYCLONEDX: org.cyclonedx:cyclonedx-maven-plugin:2.9.1
+  SONAR: org.sonarsource.scanner.maven:sonar-maven-plugin:5.9.0.7382
+  TRIVY_VERSION: v0.70.0
+
+jobs:
+  secret-scan:
+    uses: PrathameshMax/spendwise-ci/.github/workflows/secret-scan.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+
+  sast:
+    uses: PrathameshMax/spendwise-ci/.github/workflows/codeql.yml@v1
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    with:
+      language: java-kotlin
+
+  # ---- Unit tests + coverage gate -----------------------------------------
+  build-test:
+    name: build, unit tests, coverage, quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      # Full history: SonarCloud uses blame to decide which lines are new code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Maven arguments
+        env:
+          SETTINGS: ${{ inputs.maven-settings }}
+        run: |
+          if [ -n "$SETTINGS" ]; then
+            echo "MVN_SETTINGS=-s $SETTINGS" >> "$GITHUB_ENV"
+          else
+            echo "MVN_SETTINGS=" >> "$GITHUB_ENV"
+          fi
+
+      # The JaCoCo agent is prepended to surefire's argLine; the parent POM's
+      # late-bound @{argLine} keeps it alongside the Mockito agent.
+      - name: Build and unit test
+        env:
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+        run: |
+          # shellcheck disable=SC2086
+          ./mvnw -B -ntp $MVN_SETTINGS \
+            "${JACOCO}:prepare-agent" verify "${JACOCO}:report"
+
+      - name: Coverage gate
+        env:
+          MIN: ${{ inputs.coverage-min }}
+        run: |
+          mapfile -t reports < <(find . -path '*/target/site/jacoco/jacoco.csv' -not -path './.git/*')
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "### Unit test coverage: no unit tests ran" >> "$GITHUB_STEP_SUMMARY"
+            if awk -v m="$MIN" 'BEGIN { exit !(m + 0 > 0) }'; then
+              echo "::error::No JaCoCo report produced (no unit tests ran) and the gate requires ${MIN}%."
+              exit 1
+            fi
+            echo "::warning::No unit tests ran. The coverage gate is at 0% (baseline mode)."
+            exit 0
+          fi
+          # CSV columns: ... LINE_MISSED(8) LINE_COVERED(9) ... BRANCH_MISSED(6) BRANCH_COVERED(7)
+          read -r lm lc bm bc < <(awk -F, 'FNR > 1 { lm += $8; lc += $9; bm += $6; bc += $7 }
+                                          END { print lm + 0, lc + 0, bm + 0, bc + 0 }' "${reports[@]}")
+          line=$(awk -v m="$lm" -v c="$lc" 'BEGIN { printf "%.1f", (m + c) ? 100 * c / (m + c) : 0 }')
+          branch=$(awk -v m="$bm" -v c="$bc" 'BEGIN { printf "%.1f", (m + c) ? 100 * c / (m + c) : 0 }')
+          {
+            echo "### Unit test coverage"
+            echo "| Metric | Covered | Threshold |"
+            echo "|---|---|---|"
+            echo "| Lines | ${line}% | ${MIN}% |"
+            echo "| Branches | ${branch}% | — |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if awk -v l="$line" -v m="$MIN" 'BEGIN { exit !(l + 0 < m + 0) }'; then
+            echo "::error::Line coverage ${line}% is below the ${MIN}% gate."
+            exit 1
+          fi
+
+      # Static analysis on the compiled classes and the JaCoCo XML reports just
+      # produced, then wait for the quality gate verdict. A pull request is
+      # analysed as a PR (new code = its diff) and decorated with the result.
+      - name: SonarCloud analysis and quality gate
+        env:
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          ORGANIZATION: ${{ inputs.sonar-organization }}
+          PROJECT_KEY: ${{ inputs.sonar-project-key }}
+        run: |
+          key="${PROJECT_KEY:-${GITHUB_REPOSITORY_OWNER}_${GITHUB_REPOSITORY#*/}}"
+          # shellcheck disable=SC2086
+          ./mvnw -B -ntp $MVN_SETTINGS "${SONAR}:sonar" \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.organization="$ORGANIZATION" \
+            -Dsonar.projectKey="$key" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+          echo "### SonarCloud quality gate: passed ([dashboard](https://sonarcloud.io/project/overview?id=${key}))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/site/jacoco/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---- Integration tests (*IT.java, Testcontainers) -------------------------
+  # Surefire's default includes skip *IT classes and no POM binds failsafe, so
+  # these ran nowhere before this stage. They run here against real PostgreSQL
+  # containers on the runner's Docker daemon.
+  integration-test:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find integration tests
+        id: find
+        run: |
+          count=$(find . -path '*/src/test/java/*' -name '*IT.java' -not -path './.git/*' | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "### Integration tests: ${count} class(es)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        if: steps.find.outputs.count != '0'
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Run integration tests
+        if: steps.find.outputs.count != '0'
+        env:
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+          SETTINGS: ${{ inputs.maven-settings }}
+        run: |
+          args=()
+          if [ -n "$SETTINGS" ]; then args+=(-s "$SETTINGS"); fi
+          ./mvnw -B -ntp "${args[@]}" test \
+            -Dtest='*IT' \
+            -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Keep integration test reports
+        if: always() && steps.find.outputs.count != '0'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-test-reports
+          path: '**/target/surefire-reports/'
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---- Software composition analysis -----------------------------------------
+  # The SBOM is generated from Maven's resolved dependency graph (transitive,
+  # runtime scope), so the scan sees exactly what ships, not what the POM lists.
+  sca:
+    name: dependency SBOM and vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Generate dependency SBOM (CycloneDX)
+        env:
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+          SETTINGS: ${{ inputs.maven-settings }}
+        run: |
+          args=()
+          if [ -n "$SETTINGS" ]; then args+=(-s "$SETTINGS"); fi
+          ./mvnw -B -ntp "${args[@]}" "${CYCLONEDX}:makeAggregateBom" \
+            -DoutputFormat=json \
+            -DoutputName=sbom-dependencies \
+            -DincludeTestScope=false \
+            -DincludeProvidedScope=false
+          test -s target/sbom-dependencies.json
+
+      - name: Exception register
+        id: ignores
+        run: |
+          if [ -f .trivyignore.yaml ]; then
+            echo "file=.trivyignore.yaml" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan dependencies (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: sbom
+          scan-ref: target/sbom-dependencies.json
+          format: sarif
+          output: trivy-sca.sarif
+          exit-code: '0'
+          trivyignores: ${{ steps.ignores.outputs.file }}
+
+      - name: Upload dependency findings to Code scanning
+        if: always() && hashFiles('trivy-sca.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-sca.sarif
+          category: trivy-dependencies
+
+      - name: Scan dependencies (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: sbom
+          scan-ref: target/sbom-dependencies.json
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+          trivyignores: ${{ steps.ignores.outputs.file }}
+
+      - name: Keep dependency SBOM
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-dependencies
+          path: target/sbom-dependencies.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # ---- Image ----------------------------------------------------------------
+  container:
+    needs: [secret-scan, sast, build-test, integration-test, sca]
+    if: inputs.image-name != ''
+    uses: PrathameshMax/spendwise-ci/.github/workflows/container-image.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      image-name: ${{ inputs.image-name }}
+      severity: ${{ inputs.severity }}
+    secrets:
+      PACKAGES_READ_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}

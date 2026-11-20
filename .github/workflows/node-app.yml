@@ -1,0 +1,137 @@
+name: node-app
+
+# The SpendWise golden pipeline for a Node / Vite front end. Same gates and the
+# same image stages as java-service.yml; the build and dependency stages are npm.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: '22'
+      audit-level:
+        description: npm audit level that fails the build (production dependencies)
+        type: string
+        default: high
+      severity:
+        type: string
+        default: CRITICAL,HIGH
+      sonar-organization:
+        type: string
+        default: prathameshmax
+      sonar-project-key:
+        description: Empty means <owner>_<repository>
+        type: string
+        default: ''
+    secrets:
+      SONAR_TOKEN:
+        required: true
+    outputs:
+      image:
+        value: ${{ jobs.container.outputs.image }}
+      digest:
+        value: ${{ jobs.container.outputs.digest }}
+      chart:
+        value: ${{ jobs.container.outputs.chart }}
+      chart-digest:
+        value: ${{ jobs.container.outputs.chart-digest }}
+
+permissions: {}
+
+jobs:
+  secret-scan:
+    uses: PrathameshMax/spendwise-ci/.github/workflows/secret-scan.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+
+  sast:
+    uses: PrathameshMax/spendwise-ci/.github/workflows/codeql.yml@v1
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    with:
+      language: javascript-typescript
+
+  build:
+    name: install, audit, build, quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # --ignore-scripts: no package's install hook runs on the runner.
+      - name: Install (lockfile only, no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify registry signatures
+        run: npm audit signatures
+
+      - name: Dependency audit (production dependencies)
+        env:
+          LEVEL: ${{ inputs.audit-level }}
+        run: npm audit --omit=dev --audit-level="$LEVEL"
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: |
+          if npm pkg get scripts.test | grep -qv '{}'; then
+            npm test
+          else
+            echo "::warning::package.json defines no test script; the web app has no automated tests."
+            echo "### Tests: none defined in package.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Sonar project key
+        id: sonar
+        env:
+          PROJECT_KEY: ${{ inputs.sonar-project-key }}
+        run: echo "key=${PROJECT_KEY:-${GITHUB_REPOSITORY_OWNER}_${GITHUB_REPOSITORY#*/}}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarCloud analysis and quality gate
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ inputs.sonar-organization }}
+            -Dsonar.projectKey=${{ steps.sonar.outputs.key }}
+            -Dsonar.sources=src
+            -Dsonar.exclusions=dist/**,node_modules/**
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  container:
+    needs: [secret-scan, sast, build]
+    uses: PrathameshMax/spendwise-ci/.github/workflows/container-image.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      image-name: ${{ inputs.image-name }}
+      severity: ${{ inputs.severity }}
