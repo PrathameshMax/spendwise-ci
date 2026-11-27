@@ -61,6 +61,34 @@ Change Request issue (approved) ─> release.yml (manual, from main)
 | Change Request gate | `release.yml` | CR not approved, wrong service or commit, outside the window |
 | Prod | cosign verify, imagetools, GitHub Release | uat holds a different image; prod approval rejected |
 
+## Scan switches (current state: security scans paused)
+
+Each security scan can be switched off without removing it from the pipeline. A
+switched-off stage still shows in every run, marked **skipped**. The defaults in
+`java-service.yml` and `node-app.yml` are the switches for **every** repository:
+
+| Input | What it controls | Now |
+|---|---|---|
+| `secret-scan` | gitleaks over the commits being added | **on** |
+| `sast` | CodeQL | off |
+| `sca` | dependency SBOM + Trivy (Java), npm audit + signatures (web) | off |
+| `image-scan` | Trivy image scan, Helm chart misconfiguration scan | off |
+| `sonar-gate` | fail the build on the SonarCloud quality gate (off = analyse and report only) | off |
+
+Always on: build, unit tests, integration tests, coverage report, SonarCloud
+analysis (code smells, bugs, duplication on the PR), Dockerfile lint, image
+policy, publish, sign, Helm chart lint/validate/publish, promotion.
+
+To turn a scan back on for everyone, set its `default:` to `true` in both
+`java-service.yml` and `node-app.yml`, merge, then move the tag:
+
+```bash
+git checkout main && git pull && git tag -f v1 && git push -f origin v1
+```
+
+To turn one on for a single repository only, pass it in that repository's
+`ci.yml` (`with: sca: true`).
+
 ## Releasing to production
 
 1. Merge to `main`. The pipeline promotes the build to dev and sit, then waits

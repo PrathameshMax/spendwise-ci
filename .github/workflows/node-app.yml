@@ -19,6 +19,23 @@ on:
       severity:
         type: string
         default: CRITICAL,HIGH
+      # Scan switches: same meaning and defaults as java-service.yml.
+      secret-scan:
+        type: boolean
+        default: true
+      sast:
+        type: boolean
+        default: false
+      sca:
+        description: 'Switch: npm audit and registry signature check'
+        type: boolean
+        default: false
+      image-scan:
+        type: boolean
+        default: false
+      sonar-gate:
+        type: boolean
+        default: false
       sonar-organization:
         type: string
         default: prathameshmax
@@ -43,12 +60,14 @@ permissions: {}
 
 jobs:
   secret-scan:
+    if: inputs.secret-scan
     uses: PrathameshMax/spendwise-ci/.github/workflows/secret-scan.yml@v1
     permissions:
       contents: read
       security-events: write
 
   sast:
+    if: inputs.sast
     uses: PrathameshMax/spendwise-ci/.github/workflows/codeql.yml@v1
     permissions:
       contents: read
@@ -84,9 +103,11 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Verify registry signatures
+        if: inputs.sca
         run: npm audit signatures
 
       - name: Dependency audit (production dependencies)
+        if: inputs.sca
         env:
           LEVEL: ${{ inputs.audit-level }}
         run: npm audit --omit=dev --audit-level="$LEVEL"
@@ -120,11 +141,12 @@ jobs:
             -Dsonar.projectKey=${{ steps.sonar.outputs.key }}
             -Dsonar.sources=src
             -Dsonar.exclusions=dist/**,node_modules/**
-            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.wait=${{ inputs.sonar-gate }}
             -Dsonar.qualitygate.timeout=300
 
   container:
     needs: [secret-scan, sast, build]
+    if: ${{ !cancelled() && !failure() }}
     uses: PrathameshMax/spendwise-ci/.github/workflows/container-image.yml@v1
     permissions:
       contents: read
@@ -135,3 +157,4 @@ jobs:
     with:
       image-name: ${{ inputs.image-name }}
       severity: ${{ inputs.severity }}
+      image-scan: ${{ inputs.image-scan }}
