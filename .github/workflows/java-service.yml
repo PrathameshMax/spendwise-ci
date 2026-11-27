@@ -13,6 +13,11 @@ name: java-service
 #
 # Every gate runs in parallel; the image is built only when all of them pass.
 # A library repository (no Dockerfile) passes image-name: '' and stops after the gates.
+#
+# SCAN SWITCHES: each security scan below has an on/off input. The defaults are
+# the switch for every repository at once: change a default here, then move the
+# v1 tag (git tag -f v1 && git push -f origin v1). A switched-off stage is not
+# removed: its job or step still appears in every run, marked skipped.
 
 on:
   workflow_call:
@@ -36,6 +41,26 @@ on:
         description: Vulnerability severities that fail the dependency and image scans
         type: string
         default: CRITICAL,HIGH
+      secret-scan:
+        description: 'Switch: gitleaks secret scan'
+        type: boolean
+        default: true
+      sast:
+        description: 'Switch: CodeQL static security analysis'
+        type: boolean
+        default: false
+      sca:
+        description: 'Switch: dependency SBOM and vulnerability scan'
+        type: boolean
+        default: false
+      image-scan:
+        description: 'Switch: container image and Helm chart vulnerability/misconfiguration scans'
+        type: boolean
+        default: false
+      sonar-gate:
+        description: 'Switch: fail the build when the SonarCloud quality gate fails (off = analyse and report only)'
+        type: boolean
+        default: false
       sonar-organization:
         description: SonarCloud organization key
         type: string
@@ -71,12 +96,14 @@ env:
 
 jobs:
   secret-scan:
+    if: inputs.secret-scan
     uses: PrathameshMax/spendwise-ci/.github/workflows/secret-scan.yml@v1
     permissions:
       contents: read
       security-events: write
 
   sast:
+    if: inputs.sast
     uses: PrathameshMax/spendwise-ci/.github/workflows/codeql.yml@v1
     permissions:
       contents: read
@@ -170,6 +197,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           ORGANIZATION: ${{ inputs.sonar-organization }}
           PROJECT_KEY: ${{ inputs.sonar-project-key }}
+          SONAR_GATE: ${{ inputs.sonar-gate }}
         run: |
           key="${PROJECT_KEY:-${GITHUB_REPOSITORY_OWNER}_${GITHUB_REPOSITORY#*/}}"
           # shellcheck disable=SC2086
@@ -177,9 +205,14 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.organization="$ORGANIZATION" \
             -Dsonar.projectKey="$key" \
-            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.wait="$SONAR_GATE" \
             -Dsonar.qualitygate.timeout=300
-          echo "### SonarCloud quality gate: passed ([dashboard](https://sonarcloud.io/project/overview?id=${key}))" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SONAR_GATE" = "true" ]; then
+            verdict="quality gate passed"
+          else
+            verdict="analysed, quality gate not enforced (sonar-gate switch off)"
+          fi
+          echo "### SonarCloud: ${verdict} ([dashboard](https://sonarcloud.io/project/overview?id=${key}))" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep test and coverage reports
         if: always()
@@ -251,6 +284,7 @@ jobs:
   # runtime scope), so the scan sees exactly what ships, not what the POM lists.
   sca:
     name: dependency SBOM and vulnerability scan
+    if: inputs.sca
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -335,9 +369,11 @@ jobs:
           retention-days: 90
 
   # ---- Image ----------------------------------------------------------------
+  # Runs when every gate that ran has passed; a gate switched off (skipped)
+  # does not block it.
   container:
     needs: [secret-scan, sast, build-test, integration-test, sca]
-    if: inputs.image-name != ''
+    if: ${{ !cancelled() && !failure() && inputs.image-name != '' }}
     uses: PrathameshMax/spendwise-ci/.github/workflows/container-image.yml@v1
     permissions:
       contents: read
@@ -348,5 +384,6 @@ jobs:
     with:
       image-name: ${{ inputs.image-name }}
       severity: ${{ inputs.severity }}
+      image-scan: ${{ inputs.image-scan }}
     secrets:
       PACKAGES_READ_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}

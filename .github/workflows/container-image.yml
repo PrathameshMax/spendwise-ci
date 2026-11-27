@@ -26,6 +26,10 @@ on:
         description: Vulnerability severities that fail the build
         type: string
         default: CRITICAL,HIGH
+      image-scan:
+        description: 'Switch: Trivy image scan and Helm chart misconfiguration scan'
+        type: boolean
+        default: true
     secrets:
       PACKAGES_READ_TOKEN:
         description: read:packages token, passed to the Docker build as the gh_token BuildKit secret
@@ -127,6 +131,7 @@ jobs:
       # ---- Image scan ------------------------------------------------------
       # First pass: everything, to Code scanning, never fails.
       - name: Scan image (report)
+        if: inputs.image-scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
@@ -139,7 +144,7 @@ jobs:
           trivyignores: ${{ steps.names.outputs.trivyignores }}
 
       - name: Upload image findings to Code scanning
-        if: always() && hashFiles('trivy-image.sarif') != ''
+        if: always() && inputs.image-scan && hashFiles('trivy-image.sarif') != ''
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: trivy-image.sarif
@@ -149,6 +154,7 @@ jobs:
       # severities, and any secret baked into a layer, fail the build.
       # A risk-accepted CVE goes in .trivyignore.yaml with an expired_at date.
       - name: Scan image (gate)
+        if: inputs.image-scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
@@ -192,7 +198,7 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
+          skip-setup-trivy: ${{ inputs.image-scan }}
           scan-type: image
           image-ref: ${{ steps.names.outputs.local }}
           format: cyclonedx
@@ -377,7 +383,7 @@ jobs:
           kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" rendered/manifests.yaml
 
       - name: Scan rendered manifests (report)
-        if: steps.find.outputs.present == 'true'
+        if: inputs.image-scan && steps.find.outputs.present == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
@@ -388,14 +394,14 @@ jobs:
           exit-code: '0'
 
       - name: Upload chart findings to Code scanning
-        if: always() && steps.find.outputs.present == 'true' && hashFiles('trivy-chart.sarif') != ''
+        if: always() && inputs.image-scan && steps.find.outputs.present == 'true' && hashFiles('trivy-chart.sarif') != ''
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: trivy-chart.sarif
           category: trivy-chart
 
       - name: Scan rendered manifests (gate)
-        if: steps.find.outputs.present == 'true'
+        if: inputs.image-scan && steps.find.outputs.present == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
